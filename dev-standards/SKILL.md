@@ -5,6 +5,8 @@ description: "Development standards and conventions for all Go, Rust, and Next.j
 
 # Development Standards
 
+Read `references/examples.md` in this skill directory for all code examples and templates.
+
 ## Who This Is For
 
 Pete is a system architect building prototypes that will be handed to seasoned developers for production implementation. Code must be clean enough to hand off without a walkthrough. Every design decision must be documented so the receiving developer understands not just *what* but *why*.
@@ -13,271 +15,222 @@ Pete is a system architect building prototypes that will be handed to seasoned d
 
 | Context | Language | Framework |
 |---------|----------|-----------|
-| Backend services, APIs, plugins | **Go** | Standard library + minimal dependencies |
-| Performance-critical or blockchain/crypto | **Rust** | Tokio for async, Serde for serialization |
+| Backend services, APIs, plugins | **Go** | Standard library + minimal deps |
+| Performance-critical / blockchain | **Rust** | Tokio, Serde |
 | Frontend / UI | **Next.js** (TypeScript) | App Router, Tailwind CSS |
 | API communication | HTTP | REST preferred, GraphQL when appropriate |
 
-If Pete doesn't specify a language, default to Go for backend and Next.js for frontend. Ask before using anything else.
+Default to Go for backend, Next.js for frontend. Ask before using anything else.
 
 ---
 
 ## Mandatory Code Patterns
 
+See `references/examples.md#go-dependency-injection-examples` for full code samples.
+
 ### 1. Dependency Injection via Interfaces
 
-Every service, repository, and external dependency MUST be accessed through an interface. No concrete types in function signatures except at the composition root (main.go or wire setup).
+Every service, repository, and external dependency MUST be accessed through an interface. No concrete types in function signatures except at the composition root (main.go). Interfaces are defined by the consumer, not the provider.
 
-```go
-// ✅ CORRECT — service depends on interface
-type OrderService struct {
-    repo   OrderRepository  // interface
-    mailer Notifier         // interface
-}
+**Why:** Testability (mock any dependency), swappability (Postgres today, CockroachDB tomorrow), and clear contracts for the handoff developer.
 
-// ✅ CORRECT — interface defined by the consumer, not the provider
-type OrderRepository interface {
-    FindByID(ctx context.Context, id string) (*Order, error)
-    Save(ctx context.Context, order *Order) error
-}
+### 2. Context Propagation
 
-// ❌ WRONG — concrete dependency
-type OrderService struct {
-    repo *PostgresOrderRepo  // concrete type
-}
-```
+Every function that performs I/O MUST accept `context.Context` as its first parameter. No exceptions.
 
-**Why:** Testability (mock any dependency), swappability (Postgres today, CockroachDB tomorrow), and clear contracts for the receiving developer.
+### 3. Error Handling
 
-### 2. Constructor Functions Return Interfaces
+Wrap errors with context: `fmt.Errorf("failed to save order %s: %w", id, err)`. Never discard errors silently. Never use `panic` for recoverable errors.
 
-```go
-// ✅ CORRECT — returns interface type
-func NewOrderService(repo OrderRepository, mailer Notifier) *OrderService {
-    return &OrderService{repo: repo, mailer: mailer}
-}
-```
+### 4. Structured Logging
 
-### 3. Context Propagation
+Use `log/slog` (Go 1.21+). Never `fmt.Println` or `log.Printf` for operational output. JSON in production. Every service constructor accepts a `*slog.Logger` for scoped, testable logging.
 
-Every function that performs I/O (database, network, Vault, etc.) MUST accept `context.Context` as its first parameter. No exceptions.
+See `references/examples.md#structured-logging-examples`.
 
-```go
-// ✅ CORRECT
-func (s *OrderService) GetOrder(ctx context.Context, id string) (*Order, error)
+### 5. Configuration Management
 
-// ❌ WRONG — no context
-func (s *OrderService) GetOrder(id string) (*Order, error)
-```
+Non-secret config: environment variables loaded into a typed config struct at startup. Secrets: always from Vault, never from environment variables.
 
-### 4. Error Handling
+See `references/examples.md#configuration-management-pattern`.
 
-Wrap errors with context using `fmt.Errorf("...: %w", err)`. Never discard errors silently. Never use `panic` for recoverable errors.
+### 6. Graceful Shutdown
 
-```go
-// ✅ CORRECT
-if err := s.repo.Save(ctx, order); err != nil {
-    return fmt.Errorf("failed to save order %s: %w", order.ID, err)
-}
+Every Go HTTP server MUST handle graceful shutdown. In-flight requests complete before the process exits. Use `signal.Notify` for SIGINT/SIGTERM and `srv.Shutdown(ctx)` with a 30-second timeout.
 
-// ❌ WRONG — swallowed error
-s.repo.Save(ctx, order)
-
-// ❌ WRONG — no context
-return err
-```
+See `references/examples.md#graceful-shutdown-pattern`.
 
 ---
 
 ## Testing Requirements
 
+Testing is non-negotiable. Untested code is not ready for handoff.
+
+### Test Naming Convention
+
+Test names MUST be self-documenting using the pattern: `Test<Function>_<Scenario>_<ExpectedBehavior>`. A receiving developer inheriting 200 tests should understand what each tests from the name alone.
+
+Good: `TestGetOrder_RepoTimeout_ReturnsWrappedError`, `TestScore_ThreeIndexMatch_CorroborationBonus`
+Bad: `TestGetOrder2`, `TestScoreHappy`, `Test1`
+
 ### Unit Tests
 
-Every package MUST have unit tests. Tests use interfaces and mocks — never real databases or external services.
+Every package MUST have unit tests. Tests use interfaces and mocks — never real databases or external services. Table-driven tests are preferred for multiple cases.
 
-```go
-// Mock implementation for testing
-type mockOrderRepo struct {
-    orders map[string]*Order
-    err    error
-}
+See `references/examples.md#go-unit-test-patterns`.
 
-func (m *mockOrderRepo) FindByID(ctx context.Context, id string) (*Order, error) {
-    if m.err != nil {
-        return nil, m.err
-    }
-    order, ok := m.orders[id]
-    if !ok {
-        return nil, ErrNotFound
-    }
-    return order, nil
-}
-```
+### Error Path Testing (Critical)
 
-**Test file naming:** `*_test.go` in the same package.
+Every test suite MUST include error path tests. If a function can fail, test that it fails correctly. Test these scenarios for every service:
+- Repository/database failures
+- External service timeouts (use `context.WithTimeout`)
+- Invalid input (nil, empty strings, malformed data)
+- Not-found cases (distinct from errors)
+- Partial failures (one dependency fails, others succeed)
 
-**Table-driven tests** are preferred for multiple cases:
+See `references/examples.md#go-error-path-testing`.
 
-```go
-func TestScoreCalculation(t *testing.T) {
-    tests := []struct {
-        name     string
-        input    []IndexMatch
-        expected int
-    }{
-        {"no matches returns zero", nil, 0},
-        {"exact match scores high", []IndexMatch{{MatchType: "exact"}}, 80},
-        // ... more cases
-    }
-    for _, tt := range tests {
-        t.Run(tt.name, func(t *testing.T) {
-            result := Score(tt.input, testIndexDefs)
-            if result.Total != tt.expected {
-                t.Errorf("got %d, want %d", result.Total, tt.expected)
-            }
-        })
-    }
-}
-```
+### Test Helpers and Fixtures
+
+Create reusable test helpers in a `testutil` package. Use functional option overrides for test fixture construction. Avoid duplicating setup across test files.
+
+See `references/examples.md#go-test-helpers-and-fixtures`.
+
+### Interface Compliance Tests
+
+Add compile-time interface checks: `var _ Interface = (*Impl)(nil)`. This catches interface drift immediately.
 
 ### Integration Tests
 
-Integration tests use build tags to separate from unit tests:
+Use build tags (`//go:build integration`) to separate from unit tests. Run with `go test -tags=integration`. Integration tests may use real databases (Docker/testcontainers) and Vault dev servers. They MUST clean up after themselves.
 
-```go
-//go:build integration
-// +build integration
+### Frontend Testing (Next.js / TypeScript)
 
-package integration
-```
+Use **Vitest** (unit), **React Testing Library** (components), **MSW** (API mocking). Every API client function MUST have tests covering success and error responses.
 
-Run with: `go test -tags=integration ./test/integration/...`
+See `references/examples.md#frontend-testing-nextjs`.
 
-Integration tests may use real databases (via Docker/testcontainers) and real Vault dev servers. They MUST clean up after themselves.
+### HTTP Handler / API Layer Testing (Go)
 
-### Test Coverage Target
+Every HTTP handler MUST be tested using `net/http/httptest`. Test the full request/response cycle: status codes, response bodies, error responses, and middleware behavior (auth, validation). These tests catch serialization bugs, routing errors, and middleware misconfigurations that unit tests on the service layer miss.
 
-Aim for 80%+ coverage on business logic packages. Don't chase 100% — focus on the paths that matter.
+See `references/examples.md#go-http-handler-testing`.
+
+### Rust Testing
+
+For Rust projects, follow these conventions:
+- Unit tests in the same file as the code (`#[cfg(test)] mod tests`)
+- Integration tests in `tests/` directory
+- Use `#[tokio::test]` for async tests
+- Use `mockall` crate for trait mocking
+- Same error path and naming conventions as Go: `test_<function>_<scenario>_<expected>`
+- `cargo test` must pass before any commit
+
+See `references/examples.md#rust-testing`.
+
+### Test Coverage
+
+Aim for 80%+ on business logic. Error paths count and are often more important than happy paths. Don't chase 100%.
 
 ---
 
 ## Documentation Requirements
 
+Documentation is as important as code. A prototype without docs is not ready for handoff.
+
 ### Inline Documentation
 
-Every exported function, type, and constant MUST have a doc comment. Comments should explain *why*, not just *what*.
+Every exported function, type, and constant MUST have a doc comment. Comments explain *why*, not just *what*. Never restate the function signature.
 
-```go
-// ✅ CORRECT — explains the design decision
-// Score computes the confidence score for a match candidate.
-// The scoring formula uses three components (index weight, match quality,
-// corroboration) to produce a 1-100 score. Components are independently
-// capped to prevent any single factor from dominating.
-func Score(matches []IndexMatch, defs map[int]IndexDefinition) ScoreBreakdown {
-
-// ❌ WRONG — restates the function signature
-// Score scores the matches.
-func Score(matches []IndexMatch, defs map[int]IndexDefinition) ScoreBreakdown {
-```
-
-**Design decision comments:** When a non-obvious choice was made, document it with a `DESIGN DECISION:` prefix:
-
-```go
-// DESIGN DECISION: We use Dice coefficient over Jaccard because it gives
-// higher scores for partial matches, which aligns better with the identity
-// matching use case where a 6-of-8 bigram overlap should score strongly.
-```
+When a non-obvious choice was made, document it with a `DESIGN DECISION:` prefix so the receiving developer understands the reasoning.
 
 ### Project Documentation Structure
 
-Every project MUST have the following docs in a `docs/` directory, written in Markdown:
+Every project MUST have:
 
 ```
 docs/
-├── index.md                    # Table of contents linking all docs
-├── developer-guide.md          # Architecture, setup, code patterns, API reference
-├── quickstart.md               # Get running in <10 minutes
-├── admin-guide.md              # Deployment, configuration, operations (when needed)
-└── decisions/                  # Architecture Decision Records (optional)
-    ├── 001-database-choice.md
-    └── 002-vault-plugin-design.md
+├── index.md                    # TOC + machine-parseable links (REQUIRED)
+├── quickstart.md               # Zero to running in <10 min (REQUIRED)
+├── developer-guide.md          # Architecture, patterns, API ref (REQUIRED)
+├── admin-guide.md              # Ops: deployment, config, backup (WHEN NEEDED)
+└── decisions/                  # Architecture Decision Records (REQUIRED for non-trivial choices)
+    └── 001-some-decision.md
 ```
 
-#### index.md (Required)
+See `references/examples.md#documentation-index-template` for the index.md format.
 
-Acts as both human-readable table of contents and machine-parseable index:
+**quickstart.md**: Prerequisites, install, first run, verify. No architecture explanations — just the steps. MUST include:
+- Every external dependency and how to install it (Vault, database, etc.)
+- A `.env.example` file or equivalent documenting every environment variable
+- Database seeding or migration commands
+- How to start dependent services (e.g., `vault server -dev`, `docker compose up`)
+- A "verify it works" step (curl command, test script, or browser URL)
 
-```markdown
-# Project Name — Documentation Index
+A developer cloning the repo should have zero ambiguity about how to get running.
 
-## Guides
-- [Quick Start](quickstart.md) — Get running in under 10 minutes
-- [Developer Guide](developer-guide.md) — Architecture, patterns, and API reference
-- [Admin Guide](admin-guide.md) — Deployment, configuration, and operations
+**developer-guide.md**: Architecture overview, project structure, code patterns, how to add features, API reference, testing guide. The receiving developer reads this first.
 
-## Architecture Decisions
-- [ADR-001: Database Choice](decisions/001-database-choice.md)
+**admin-guide.md**: Create when operational concerns exist (Vault config, migrations, backups, monitoring). Not every prototype needs this — ask Pete.
 
-## API Reference
-- [REST API](developer-guide.md#rest-api)
-```
+### Architecture Decision Records (Required for non-trivial choices)
 
-#### quickstart.md (Required)
+Any decision involving technology selection, security boundaries, data model design, or trade-offs MUST be documented as an ADR in `docs/decisions/`. Use sequential numbering and the standard format.
 
-Prerequisites, install steps, first run, verify it works. A developer should go from zero to running in under 10 minutes. No explanations of architecture — just the steps.
+See `references/examples.md#adr-template`.
 
-#### developer-guide.md (Required)
+Examples of decisions that require ADRs:
+- Database choice (Oracle vs PostgreSQL)
+- Vault custom plugin vs transit engine
+- Bloom filter parameters and similarity thresholds
+- API authentication approach
+- Choice to use phonetic encoding for fuzzy matching
 
-Architecture overview, project structure, code patterns, how to add features, API reference, testing guide. This is the document the receiving developer reads first.
+### CHANGELOG.md (Required)
 
-#### admin-guide.md (When Needed)
+Every project MUST maintain a CHANGELOG using Keep a Changelog format. Update with every version bump. Categories: Added, Changed, Deprecated, Removed, Fixed, Security.
 
-Create this when the project has operational concerns: Vault configuration, database migrations, backup procedures, monitoring, scaling. Not every prototype needs this — ask Pete.
+See `references/examples.md#changelog-template`.
+
+### API Documentation (Required for HTTP endpoints)
+
+Document every endpoint with: path, method, request schema + example, response schema + example, error codes, auth requirements. Document in developer-guide.md for prototypes.
+
+See `references/examples.md#api-documentation-template`.
+
+### README.md (Required)
+
+Follow the standard template: one-line description, quick start, architecture diagram, dev commands, doc links, version.
+
+See `references/examples.md#readme-template`.
 
 ### Markdown Formatting for Export
 
-Docs should render cleanly as PDF (via pandoc or similar) and be parseable by LLMs:
-
-- Use ATX headers (`#`, `##`, `###`) consistently
-- Use fenced code blocks with language identifiers
-- Use tables for structured data
-- Keep lines under 100 characters for readability
-- Use relative links between docs (not absolute paths)
-- Include a YAML front matter block for PDF metadata:
-
-```markdown
----
-title: "PersonaLink Developer Guide"
-version: "0.1.0"
-date: 2026-02-28
----
-```
+Docs must render cleanly as PDF (pandoc) and be parseable by LLMs:
+- ATX headers (`#`, `##`, `###`) consistently
+- Fenced code blocks with language identifiers
+- Tables for structured data
+- Lines under 100 characters
+- Relative links between docs
+- YAML front matter for PDF metadata (`title`, `version`, `date`)
 
 ---
 
 ## Versioning
 
-All projects use **Semantic Versioning** starting at `v0.0.1`.
+Semantic Versioning starting at `v0.0.1`.
 
-### Rules
+| Component | When to Bump | Permission |
+|-----------|--------------|------------|
+| Patch (0.0.x) | Bug fixes, docs, minor improvements | **Automatic** |
+| Minor (0.x.0) | New features, non-breaking API changes | **Ask Pete** |
+| Major (x.0.0) | Breaking API changes, architecture shifts | **Ask Pete** |
 
-| Version Component | When to Bump | Permission Required |
-|-------------------|--------------|---------------------|
-| Patch (0.0.x) | Bug fixes, documentation, minor improvements | **No — bump automatically** |
-| Minor (0.x.0) | New features, non-breaking API changes | **Ask Pete first** |
-| Major (x.0.0) | Breaking API changes, major architecture shifts | **Ask Pete first** |
-
-### Version Location
-
-- `go.mod` or `Cargo.toml` — the source of truth
-- `VERSION` file in project root (plain text, just the version string)
-- Tag in git: `git tag v0.0.1`
-
-When making changes, check the current version and bump the patch automatically. If the change warrants a minor or major bump, ask before doing it.
+Version lives in: `VERSION` file (source of truth), `go.mod`/`Cargo.toml`, git tag.
 
 ---
 
-## Project Structure Conventions
+## Project Structure
 
 ### Go Projects
 
@@ -285,23 +238,22 @@ When making changes, check the current version and bump the patch automatically.
 project-name/
 ├── cmd/
 │   ├── server/main.go          # API server entry point
-│   └── cli/main.go             # CLI tool entry point (if needed)
-├── internal/                   # Private packages (not importable by other projects)
+│   └── cli/main.go             # CLI tool (if needed)
+├── internal/                   # Private packages
+│   ├── config/                 # Typed configuration
 │   ├── model/                  # Domain types
 │   ├── service/                # Business logic (depends on interfaces)
 │   ├── repository/             # Data access (implements interfaces)
-│   └── {feature}/              # Feature-specific packages
-├── pkg/                        # Public packages (importable by other projects)
-│   └── api/                    # HTTP handlers, middleware, request/response types
+│   └── testutil/               # Shared test helpers and fixtures
+├── pkg/api/                    # HTTP handlers, middleware, request/response
 ├── db/
-│   ├── schema.sql              # Database schema
-│   └── migrations/             # Versioned migrations
-├── docs/                       # Documentation (see above)
-├── test/
-│   └── integration/            # Integration tests (build-tagged)
+│   ├── schema.sql
+│   └── migrations/
+├── docs/                       # See documentation structure above
+├── test/integration/           # Integration tests (build-tagged)
 ├── go.mod
-├── go.sum
 ├── VERSION
+├── CHANGELOG.md
 ├── Dockerfile
 └── README.md
 ```
@@ -311,44 +263,21 @@ project-name/
 ```
 project-name-ui/
 ├── src/
-│   ├── app/                    # Next.js App Router pages
-│   ├── components/             # Reusable React components
-│   ├── lib/                    # Utility functions, API client
-│   ├── hooks/                  # Custom React hooks
-│   └── types/                  # TypeScript type definitions
-├── public/                     # Static assets
-├── docs/                       # Documentation
+│   ├── app/                    # App Router pages
+│   ├── components/             # Reusable components
+│   ├── lib/                    # Utilities, API client
+│   ├── hooks/                  # Custom hooks
+│   └── types/                  # TypeScript types
+├── docs/
 ├── package.json
-├── tsconfig.json
-├── tailwind.config.ts
 ├── VERSION
+├── CHANGELOG.md
 └── README.md
 ```
 
 ### API Communication
 
-Frontend communicates with backend via HTTP. Use a typed API client:
-
-```typescript
-// src/lib/api-client.ts
-export class ApiClient {
-  private baseUrl: string;
-
-  constructor(baseUrl: string) {
-    this.baseUrl = baseUrl;
-  }
-
-  async lookup(req: LookupRequest): Promise<LookupResponse> {
-    const res = await fetch(`${this.baseUrl}/api/v1/lookup`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req),
-    });
-    if (!res.ok) throw new ApiError(res.status, await res.text());
-    return res.json();
-  }
-}
-```
+Frontend talks to backend via HTTP with a typed API client. See `references/examples.md#nextjs-api-client-pattern`.
 
 ---
 
@@ -357,12 +286,17 @@ export class ApiClient {
 Before presenting code to Pete, verify:
 
 - [ ] All exported functions have doc comments explaining *why*
-- [ ] Design decisions are documented with `DESIGN DECISION:` prefix
-- [ ] All dependencies are injected via interfaces
+- [ ] Design decisions documented with `DESIGN DECISION:` prefix
+- [ ] All dependencies injected via interfaces
 - [ ] All I/O functions accept `context.Context`
-- [ ] Errors are wrapped with context (`fmt.Errorf("...: %w", err)`)
-- [ ] Unit tests exist for business logic
-- [ ] Integration test stubs exist (even if not fully implemented)
-- [ ] `docs/index.md` and `docs/quickstart.md` exist
+- [ ] Errors wrapped with context (`fmt.Errorf("...: %w", err)`)
+- [ ] Structured logging via `slog` (no fmt.Println/log.Printf)
+- [ ] Graceful shutdown implemented for HTTP servers
+- [ ] Unit tests exist for business logic, **including error paths**
+- [ ] Interface compliance checks (`var _ Interface = (*Impl)(nil)`)
+- [ ] Integration test stubs exist
+- [ ] `docs/index.md`, `docs/quickstart.md`, `docs/developer-guide.md` exist
+- [ ] API endpoints documented with request/response examples
+- [ ] `CHANGELOG.md` updated with current changes
 - [ ] `VERSION` file exists with current version
-- [ ] `README.md` explains what the project is and how to run it
+- [ ] `README.md` follows the template structure
